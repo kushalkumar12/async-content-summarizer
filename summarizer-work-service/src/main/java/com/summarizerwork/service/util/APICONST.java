@@ -1,4 +1,4 @@
-package com.summarizerapi.service.util;
+package com.summarizerwork.service.util;
 
 public interface APICONST {
 	String QUEUED = "QUEUED";

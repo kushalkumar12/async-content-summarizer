@@ -17,11 +17,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import lombok.extern.slf4j.Slf4j;
 
-/**
- * GeminiService with Dynamic Model Failover.
- * Mimics the Google Python SDK behavior by listing available models 
- * and iterating through them until a successful response is received.
- */
 @Slf4j
 @Service
 public class GeminiService {
@@ -35,38 +30,14 @@ public class GeminiService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    /**
-     * EXISTING METHOD: Keep this signature so your current code doesn't break.
-     * usage: summary = geminiService.summarize(content);
-     */
     public String summarize(String content) {
         String defaultPrompt = "Please provide a clear and concise summary of the following content. " +
-                               "Keep it under 200 words and focus on the main points: \n\n" + content;
-        
+                               "Focus on the main points and ensure the summary is complete with a proper ending sentence:\n\n"
+                               + content;
+
         return executeWithFailover(defaultPrompt);
     }
 
-    /**
-     * NEW METHOD: For ATS/Resume matching (similar to your Streamlit app).
-     */
-    public String analyzeATS(String resumeText, String jobDescription) {
-        String atsPrompt = """
-            Hey Act Like a skilled or very experienced ATS (Application Tracking System)
-            with a deep understanding of tech field, software engineering, data science.
-            
-            resume: %s
-            description: %s
-            
-            I want the response in a strictly valid JSON format with the following structure:
-            {"JD Match": "percentage_value", "MissingKeywords": ["keyword1", "keyword2"], "Profile Summary": "summary_text"}
-            """.formatted(resumeText, jobDescription);
-        
-        return executeWithFailover(atsPrompt);
-    }
-
-    /**
-     * CORE ENGINE: Fetches available models and tries each one.
-     */
     private String executeWithFailover(String finalPrompt) {
         List<String> models = getAvailableModels();
 
@@ -77,24 +48,24 @@ public class GeminiService {
 
         for (String modelName : models) {
             try {
-                log.info("🔄 Attempting request with model: {}", modelName);
-                return callGeminiApi(finalPrompt, modelName);
+                log.info("Attempting request with model: {}", modelName);
+                String result = callGeminiApi(finalPrompt, modelName);
+                log.info("Model {} returned a complete response.", modelName);
+                return result;
+            } catch (TruncatedResponseException e) {
+                // Response was cut off — skip this model and try the next one
+                log.warn("Model {} returned a truncated response. Trying next model...", modelName);
             } catch (Exception e) {
-                log.warn("❌ Model {} failed: {}. Trying next...", modelName, e.getMessage());
-                // Continue loop to try the next available model
+                log.warn("Model {} failed: {}. Trying next...", modelName, e.getMessage());
             }
         }
 
-        throw new RuntimeException("Fatal: All available Gemini models failed to process the request.");
+        throw new RuntimeException("Fatal: All available Gemini models failed to return a complete response.");
     }
 
-    /**
-     * Equivalent to Python's genai.list_models()
-     */
     private List<String> getAvailableModels() {
         List<String> modelList = new ArrayList<>();
         try {
-            // v1beta is used here as it's the most reliable for listing experimental/new models
             String url = "https://generativelanguage.googleapis.com/v1beta/models?key=" + apiKey;
 
             HttpRequest request = HttpRequest.newBuilder()
@@ -113,8 +84,8 @@ public class GeminiService {
             JsonNode modelsNode = root.path("models");
 
             for (JsonNode m : modelsNode) {
-                String name = m.path("name").asText(); // Usually "models/gemini-..."
-                
+                String name = m.path("name").asText(); // e.g. "models/gemini-1.5-flash"
+
                 // Only include models that support text generation
                 boolean supportsGenerate = false;
                 for (JsonNode method : m.path("supportedGenerationMethods")) {
@@ -129,9 +100,9 @@ public class GeminiService {
                 }
             }
 
-            // Optimization: Sort to prioritize 'flash' models (faster/cheaper) over 'pro'
+            // Prioritize 'flash' models (faster/cheaper) first
             modelList.sort(Comparator.comparing(name -> !name.toLowerCase().contains("flash")));
-            
+
             log.info("Discovered {} usable Gemini models.", modelList.size());
 
         } catch (Exception e) {
@@ -140,15 +111,11 @@ public class GeminiService {
         return modelList;
     }
 
-    /**
-     * Performs the actual HTTP POST to the Gemini API.
-     */
+     //Performs the actual HTTP POST to the Gemini API.
     private String callGeminiApi(String prompt, String modelName) throws Exception {
-        // modelName already contains the "models/" prefix from the list API
-        String url = "https://generativelanguage.googleapis.com/v1beta/" + 
+        String url = "https://generativelanguage.googleapis.com/v1beta/" +
                      modelName + ":generateContent?key=" + apiKey;
 
-        // Safely escape the prompt as a JSON string using Jackson
         String escapedPrompt = objectMapper.writeValueAsString(prompt);
 
         String requestBody = """
@@ -164,10 +131,11 @@ public class GeminiService {
                 ],
                 "generationConfig": {
                     "temperature": 0.3,
-                    "maxOutputTokens": 800
+                    "maxOutputTokens": 2048
                 }
             }
             """.formatted(escapedPrompt);
+        // ↑ Increased from 800 → 2048 to give the model enough room for a full summary.
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
@@ -179,23 +147,53 @@ public class GeminiService {
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() != 200) {
-            throw new RuntimeException("HTTP " + response.statusCode() + " from " + modelName);
+            throw new RuntimeException("HTTP " + response.statusCode() + " from " + modelName + ": " + response.body());
         }
 
         JsonNode root = objectMapper.readTree(response.body());
-        
-        // Extract the text from the candidates path
-        JsonNode textNode = root.path("candidates")
-                               .get(0)
-                               .path("content")
-                               .path("parts")
-                               .get(0)
-                               .path("text");
 
-        if (textNode.isMissingNode()) {
-            throw new RuntimeException("Model returned empty or blocked response.");
+        JsonNode candidate = root.path("candidates").get(0);
+        if (candidate == null) {
+            throw new RuntimeException("No candidates in response from " + modelName);
+        }
+
+        // FIX: Check finishReason BEFORE returning the text.
+        // If MAX_TOKENS → the summary is cut off → throw TruncatedResponseException
+        // so the failover loop moves to the next model.
+        String finishReason = candidate.path("finishReason").asText("");
+        if ("MAX_TOKENS".equalsIgnoreCase(finishReason)) {
+            throw new TruncatedResponseException(
+                "Model " + modelName + " hit token limit (MAX_TOKENS). Response is incomplete."
+            );
+        }
+
+        // Also guard against SAFETY or other non-STOP reasons
+        if (!"STOP".equalsIgnoreCase(finishReason) && !finishReason.isEmpty()) {
+            throw new RuntimeException(
+                "Model " + modelName + " stopped with unexpected reason: " + finishReason
+            );
+        }
+
+        JsonNode textNode = candidate
+                .path("content")
+                .path("parts")
+                .get(0)
+                .path("text");
+
+        if (textNode == null || textNode.isMissingNode() || textNode.asText().isBlank()) {
+            throw new RuntimeException("Model " + modelName + " returned an empty response body.");
         }
 
         return textNode.asText();
+    }
+
+    /**
+     * Thrown specifically when a model returns a response cut off by the token limit.
+     * Allows the failover loop to distinguish truncation from a hard error.
+     */
+    private static class TruncatedResponseException extends Exception {
+        public TruncatedResponseException(String message) {
+            super(message);
+        }
     }
 }

@@ -37,10 +37,10 @@ public class KafkaProducerService {
 			String json = objectMapper.writeValueAsString(message);
 
 			kafkaTemplate.send(topic, jobId, json);
-			log.info("Sent job {} to Kafka topic {}", jobId, topic);
+			log.info("Sent job to Kafka topic", jobId, topic);
 
 		} catch (Exception e) {
-			log.error("Failed to send job {} to Kafka: {}", jobId, e.getMessage());
+			log.error("Failed to send job to Kafka: ", jobId, e.getMessage());
 			throw new RuntimeException("Failed to queue job", e);
 		}
 	}
